@@ -8608,6 +8608,13 @@
                      </property>
                     </widget>
                    </item>
+                   <item row="6" column="1">
+                    <widget class="QCheckBox" name="enableReconnectRequest">
+                     <property name="text">
+                      <string>Basic.Settings.Advanced.Network.EnableReconnectRequest</string>
+                     </property>
+                    </widget>
+                   </item>
                    <item row="4" column="0">
                     <spacer name="horizontalSpacer_7">
                      <property name="orientation">
@@ -8991,6 +8998,7 @@
   <tabstop>bindToIP</tabstop>
   <tabstop>dynBitrate</tabstop>
   <tabstop>enableNewSocketLoop</tabstop>
+  <tabstop>enableReconnectRequest</tabstop>
   <tabstop>enableLowLatencyMode</tabstop>
   <tabstop>browserHWAccel</tabstop>
   <tabstop>hotkeyFocusType</tabstop>

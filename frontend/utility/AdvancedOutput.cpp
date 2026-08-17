@@ -733,6 +733,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	bool enableLowLatencyMode = config_get_bool(main->Config(), "Output", "LowLatencyEnable");
 #endif
 	bool enableDynBitrate = config_get_bool(main->Config(), "Output", "DynamicBitrate");
+	bool enableReconnectRequest = config_get_bool(main->Config(), "Output", "ReconnectRequestEnable");
 
 	bool is_rtmp = false;
 	obs_service_t *service_obj = main->GetService();
@@ -751,6 +752,7 @@ bool AdvancedOutput::StartStreaming(obs_service_t *service)
 	obs_data_set_bool(settings, "low_latency_mode_enabled", enableLowLatencyMode);
 #endif
 	obs_data_set_bool(settings, "dyn_bitrate", enableDynBitrate);
+	obs_data_set_bool(settings, "ertmp_reconnect_request", enableReconnectRequest);
 
 	auto streamOutput = StreamingOutput(); // shadowing is sort of bad, but also convenient
 

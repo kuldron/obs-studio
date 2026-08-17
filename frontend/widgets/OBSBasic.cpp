@@ -827,6 +827,7 @@ bool OBSBasic::InitBasicConfigDefaults()
 	config_set_default_string(activeConfiguration, "Output", "IPFamily", "IPv4+IPv6");
 	config_set_default_bool(activeConfiguration, "Output", "NewSocketLoopEnable", false);
 	config_set_default_bool(activeConfiguration, "Output", "LowLatencyEnable", false);
+	config_set_default_bool(activeConfiguration, "Output", "ReconnectRequestEnable", false);
 
 	int i = 0;
 	uint32_t scale_cx = cx;

@@ -574,6 +574,7 @@ OBSBasicSettings::OBSBasicSettings(QWidget *parent)
 	HookWidget(ui->ipFamily,             COMBO_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->enableNewSocketLoop,  CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->enableLowLatencyMode, CHECK_CHANGED,  ADV_CHANGED);
+	HookWidget(ui->enableReconnectRequest, CHECK_CHANGED, ADV_CHANGED);
 	HookWidget(ui->hotkeyFocusType,      COMBO_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->autoRemux,            CHECK_CHANGED,  ADV_CHANGED);
 	HookWidget(ui->dynBitrate,           CHECK_CHANGED,  ADV_CHANGED);
@@ -2695,6 +2696,9 @@ void OBSBasicSettings::LoadAdvancedSettings()
 	prevBrowserAccel = ui->browserHWAccel->isChecked();
 #endif
 
+	ui->enableReconnectRequest->setChecked(
+		config_get_bool(main->Config(), "Output", "ReconnectRequestEnable"));
+
 	SetComboByValue(ui->hotkeyFocusType, hotkeyFocusType);
 
 	loading = false;
@@ -3290,6 +3294,8 @@ void OBSBasicSettings::SaveAdvancedSettings()
 	bool browserHWAccel = ui->browserHWAccel->isChecked();
 	config_set_bool(App()->GetAppConfig(), "General", "BrowserHWAccel", browserHWAccel);
 #endif
+
+	SaveCheckBox(ui->enableReconnectRequest, "Output", "ReconnectRequestEnable");
 
 	if (WidgetChanged(ui->hotkeyFocusType)) {
 		QString str = GetComboData(ui->hotkeyFocusType);
