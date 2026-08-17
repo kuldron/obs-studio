@@ -1,0 +1,32 @@
+FROM registry.fedoraproject.org/fedora:44
+
+RUN dnf -y install 'dnf-command(builddep)' dnf5-plugins
+RUN dnf -y install --nogpgcheck \
+      https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm || \
+    dnf -y install --nogpgcheck \
+      https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-43.noarch.rpm
+RUN dnf -y install cmake ninja-build gcc gcc-c++ git pkgconf-pkg-config
+RUN dnf -y builddep --nogpgcheck obs-studio || true
+RUN dnf -y install \
+      ffmpeg-free-devel jansson-devel mbedtls-devel zlib-ng-devel \
+      libuuid-devel libX11-devel libxcb-devel xcb-util-devel \
+      libXcomposite-devel libXinerama-devel libXrandr-devel \
+      libxkbcommon-devel wayland-devel wayland-protocols-devel \
+      libdrm-devel mesa-libGL-devel mesa-libEGL-devel \
+      pulseaudio-libs-devel pipewire-devel glib2-devel libglvnd-devel \
+      libva-devel x264-devel libvpx-devel opus-devel \
+      uthash-devel simde-devel nlohmann-json-devel \
+      mesa-dri-drivers mesa-libgbm libglvnd-egl \
+      nodejs procps-ng iproute python3 gdb valgrind tcpdump --skip-unavailable
+RUN dnf -y install --nogpgcheck x264-devel x264-libs || echo "x264 unavailable"
+RUN dnf clean all
+WORKDIR /src
+RUN dnf -y install xorg-x11-server-Xvfb mesa-libGL mesa-libEGL libglvnd-glx && dnf clean all
+RUN dnf -y install ffmpeg-free tar gzip curl && dnf clean all
+# A second, unmodified third-party RTMP server for the regression check.
+RUN curl -fsSL -o /tmp/mediamtx.tar.gz \
+      https://github.com/bluenviron/mediamtx/releases/download/v1.16.1/mediamtx_v1.16.1_linux_amd64.tar.gz && \
+    tar -xzf /tmp/mediamtx.tar.gz -C /usr/local/bin mediamtx && \
+    rm -f /tmp/mediamtx.tar.gz && /usr/local/bin/mediamtx --version
+RUN dnf -y install openssl ca-certificates && dnf clean all
+RUN dnf -y install libasan libubsan && dnf clean all
