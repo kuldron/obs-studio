@@ -747,14 +747,16 @@ static void *send_thread(void *data)
 	return NULL;
 }
 
-static bool send_meta_data(struct rtmp_stream *stream)
+/* `rtmp` is a parameter rather than stream->rtmp so that a caller can put the
+ * metadata on a connection that is not (yet) the active one. */
+static bool send_meta_data(struct rtmp_stream *stream, RTMP *rtmp)
 {
 	uint8_t *meta_data;
 	size_t meta_data_size;
 	bool success = true;
 
 	flv_meta_data(stream->output, &meta_data, &meta_data_size, false);
-	success = RTMP_Write(&stream->rtmp, (char *)meta_data, (int)meta_data_size, 0) >= 0;
+	success = RTMP_Write(rtmp, (char *)meta_data, (int)meta_data_size, 0) >= 0;
 	bfree(meta_data);
 
 	return success;
@@ -1079,7 +1081,7 @@ static int init_send(struct rtmp_stream *stream)
 
 	os_atomic_set_bool(&stream->active, true);
 
-	if (!send_meta_data(stream)) {
+	if (!send_meta_data(stream, &stream->rtmp)) {
 		warn("Disconnected while attempting to send metadata");
 		set_output_error(stream);
 		return OBS_OUTPUT_DISCONNECTED;
@@ -1091,9 +1093,8 @@ static int init_send(struct rtmp_stream *stream)
 }
 
 #ifdef _WIN32
-static void win32_log_interface_type(struct rtmp_stream *stream)
+static void win32_log_interface_type(struct rtmp_stream *stream, RTMP *rtmp)
 {
-	RTMP *rtmp = &stream->rtmp;
 	MIB_IPFORWARDROW route;
 	uint32_t dest_addr, source_addr;
 	char hostname[256];
@@ -1162,69 +1163,90 @@ static void win32_log_interface_type(struct rtmp_stream *stream)
 }
 #endif
 
-static int try_connect(struct rtmp_stream *stream)
+/*
+ * Brings `rtmp` all the way to "publishing to `path`", short of starting the
+ * send machinery.
+ *
+ * `path` must outlive `rtmp`: RTMP_SetupURL does not copy the URL, it points
+ * Link.hostname, Link.app and Link.tcUrl straight into the string it is given.
+ *
+ * Failures are reported to the caller rather than raised on the output here,
+ * because not every caller of this is establishing the connection the user is
+ * waiting on.
+ */
+static int connect_rtmp(struct rtmp_stream *stream, RTMP *rtmp, struct dstr *path)
 {
-	if (dstr_is_empty(&stream->path)) {
+	if (dstr_is_empty(path)) {
 		warn("URL is empty");
 		return OBS_OUTPUT_BAD_PATH;
 	}
 
-	info("Connecting to RTMP URL %s...", stream->path.array);
+	info("Connecting to RTMP URL %s...", path->array);
 
 	// free any existing RTMP TLS context
-	RTMP_TLS_Free(&stream->rtmp);
+	RTMP_TLS_Free(rtmp);
 
-	RTMP_Init(&stream->rtmp);
+	RTMP_Init(rtmp);
 
-	if (!RTMP_SetupURL(&stream->rtmp, stream->path.array))
+	if (!RTMP_SetupURL(rtmp, path->array))
 		return OBS_OUTPUT_BAD_PATH;
 
-	RTMP_EnableWrite(&stream->rtmp);
+	RTMP_EnableWrite(rtmp);
 
 	dstr_copy(&stream->encoder_name, "FMLE/3.0 (compatible; FMSc/1.0)");
 
-	set_rtmp_dstr(&stream->rtmp.Link.pubUser, &stream->username);
-	set_rtmp_dstr(&stream->rtmp.Link.pubPasswd, &stream->password);
-	set_rtmp_dstr(&stream->rtmp.Link.flashVer, &stream->encoder_name);
-	stream->rtmp.Link.swfUrl = stream->rtmp.Link.tcUrl;
+	set_rtmp_dstr(&rtmp->Link.pubUser, &stream->username);
+	set_rtmp_dstr(&rtmp->Link.pubPasswd, &stream->password);
+	set_rtmp_dstr(&rtmp->Link.flashVer, &stream->encoder_name);
+	rtmp->Link.swfUrl = rtmp->Link.tcUrl;
 
 	if (dstr_is_empty(&stream->bind_ip) || dstr_cmp(&stream->bind_ip, "default") == 0) {
-		memset(&stream->rtmp.m_bindIP, 0, sizeof(stream->rtmp.m_bindIP));
+		memset(&rtmp->m_bindIP, 0, sizeof(rtmp->m_bindIP));
 	} else {
-		bool success = netif_str_to_addr(&stream->rtmp.m_bindIP.addr, &stream->rtmp.m_bindIP.addrLen,
-						 stream->bind_ip.array);
+		bool success =
+			netif_str_to_addr(&rtmp->m_bindIP.addr, &rtmp->m_bindIP.addrLen, stream->bind_ip.array);
 		if (success) {
-			int len = stream->rtmp.m_bindIP.addrLen;
+			int len = rtmp->m_bindIP.addrLen;
 			bool ipv6 = len == sizeof(struct sockaddr_in6);
 			info("Binding to IPv%d", ipv6 ? 6 : 4);
 		}
 	}
 
 	// Only use the IPv4 / IPv6 hint if a binding address isn't specified.
-	if (stream->rtmp.m_bindIP.addrLen == 0)
-		stream->rtmp.m_bindIP.addrLen = stream->addrlen_hint;
+	if (rtmp->m_bindIP.addrLen == 0)
+		rtmp->m_bindIP.addrLen = stream->addrlen_hint;
 
-	RTMP_AddStream(&stream->rtmp, stream->key.array);
+	RTMP_AddStream(rtmp, stream->key.array);
 
-	stream->rtmp.m_outChunkSize = 4096;
-	stream->rtmp.m_bSendChunkSizeInfo = true;
-	stream->rtmp.m_bUseNagle = true;
+	rtmp->m_outChunkSize = 4096;
+	rtmp->m_bSendChunkSizeInfo = true;
+	rtmp->m_bUseNagle = true;
 
 #ifdef _WIN32
-	win32_log_interface_type(stream);
+	win32_log_interface_type(stream, rtmp);
 #endif
 
-	if (!RTMP_Connect(&stream->rtmp, NULL)) {
-		set_output_error(stream);
+	if (!RTMP_Connect(rtmp, NULL))
 		return OBS_OUTPUT_CONNECT_FAILED;
-	}
 
-	if (!RTMP_ConnectStream(&stream->rtmp, 0))
+	if (!RTMP_ConnectStream(rtmp, 0))
 		return OBS_OUTPUT_INVALID_STREAM;
 
 	char ip_address[INET6_ADDRSTRLEN] = {0};
-	netif_addr_to_str(&stream->rtmp.m_sb.sb_addr, ip_address, INET6_ADDRSTRLEN);
-	info("Connection to %s (%s) successful", stream->path.array, ip_address);
+	netif_addr_to_str(&rtmp->m_sb.sb_addr, ip_address, INET6_ADDRSTRLEN);
+	info("Connection to %s (%s) successful", path->array, ip_address);
+
+	return OBS_OUTPUT_SUCCESS;
+}
+
+static int try_connect(struct rtmp_stream *stream)
+{
+	int ret = connect_rtmp(stream, &stream->rtmp, &stream->path);
+	if (ret != OBS_OUTPUT_SUCCESS) {
+		if (ret == OBS_OUTPUT_CONNECT_FAILED)
+			set_output_error(stream);
+		return ret;
+	}
 
 	return init_send(stream);
 }
