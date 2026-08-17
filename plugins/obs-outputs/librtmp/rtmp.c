@@ -487,6 +487,12 @@ RTMP_EnableWrite(RTMP *r)
     r->Link.protocol |= RTMP_FEATURE_WRITE;
 }
 
+void
+RTMP_SetCapsEx(RTMP *r, int caps)
+{
+    r->Link.capsEx = caps;
+}
+
 double
 RTMP_GetDuration(RTMP *r)
 {
@@ -1647,6 +1653,7 @@ SAVC(secureToken);
 SAVC(secureTokenResponse);
 SAVC(type);
 SAVC(nonprivate);
+SAVC(capsEx);
 
 static int
 SendConnectPacket(RTMP *r, RTMPPacket *cp)
@@ -1744,6 +1751,13 @@ SendConnectPacket(RTMP *r, RTMPPacket *cp)
             if (!enc)
                 return FALSE;
         }
+    }
+    if (r->Link.capsEx)
+    {
+        /* Enhanced RTMP v2, "Enhancing NetConnection connect Command". */
+        enc = AMF_EncodeNamedNumber(enc, pend, &av_capsEx, (double)r->Link.capsEx);
+        if (!enc)
+            return FALSE;
     }
     if (r->m_fEncoding != 0.0 || r->m_bSendEncoding)
     {

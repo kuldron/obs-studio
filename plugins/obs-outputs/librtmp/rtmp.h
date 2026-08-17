@@ -197,6 +197,15 @@ extern "C"
 #define RTMP_PROTOCOL_RTMPTS    (RTMP_FEATURE_HTTP|RTMP_FEATURE_SSL)
 #define RTMP_PROTOCOL_RTMFP     RTMP_FEATURE_MFP
 
+    /* Enhanced RTMP v2 "CapsExMask": the extended capabilities a client can
+     * declare to the server through the capsEx property of the connect
+     * command. Only advertise a bit the caller genuinely implements -- the
+     * server is entitled to act on it. */
+#define RTMP_CAPS_EX_RECONNECT             0x01
+#define RTMP_CAPS_EX_MULTITRACK            0x02
+#define RTMP_CAPS_EX_MODEX                 0x04
+#define RTMP_CAPS_EX_TIMESTAMP_NANOOFFSET  0x08
+
 #define RTMP_DEFAULT_CHUNKSIZE	128
 
     /* needs to fit largest number of bytes recv() may return */
@@ -301,6 +310,11 @@ extern "C"
         AVal sockshost;
 
         CUSTOMCONNECTENCODING customConnectEncode;
+
+        /* Enhanced RTMP v2 capsEx bits to declare in connect. Zero means the
+         * property is omitted entirely, which is what a client that supports
+         * none of the extended capabilities must send. */
+        int capsEx;
 
         AVal tcUrl;
         AVal swfUrl;
@@ -516,6 +530,9 @@ extern "C"
     void RTMP_TLS_Free(RTMP *r);
     void RTMP_Free(RTMP *r);
     void RTMP_EnableWrite(RTMP *r);
+    /* Declare Enhanced RTMP v2 extended capabilities (RTMP_CAPS_EX_*) in the
+     * next connect command. Must be called after RTMP_Init, which clears it. */
+    void RTMP_SetCapsEx(RTMP *r, int caps);
 
     int RTMP_LibVersion(void);
     void RTMP_UserInterrupt(void);	/* user typed Ctrl-C */
