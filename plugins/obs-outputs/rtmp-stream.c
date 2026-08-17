@@ -122,8 +122,14 @@ static void rtmp_stream_destroy(void *data)
 	}
 
 	RTMP_TLS_Free(&stream->rtmp);
+	/* The send thread has been joined above, so it has already run
+	 * reconnect_abort(); this only covers a stream destroyed before it ever
+	 * ran, where the context is zeroed and both calls are no-ops. */
+	RTMP_TLS_Free(&stream->handoff_rtmp);
 	free_packets(stream);
 	dstr_free(&stream->path);
+	dstr_free(&stream->reconnect_url);
+	dstr_free(&stream->handoff_path);
 	dstr_free(&stream->key);
 	dstr_free(&stream->username);
 	dstr_free(&stream->password);
@@ -245,6 +251,181 @@ static inline bool get_next_packet(struct rtmp_stream *stream, struct encoder_pa
 	return new_packet;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Enhanced RTMP v2 "Reconnect Request", client side.                        */
+
+static const AVal av_onStatus = AVC("onStatus");
+static const AVal av_level = AVC("level");
+static const AVal av_code = AVC("code");
+static const AVal av_tcUrl = AVC("tcUrl");
+static const AVal av_description = AVC("description");
+static const AVal av_status = AVC("status");
+static const AVal av_reconnect_request = AVC("NetConnection.Connect.ReconnectRequest");
+
+/* How many refused requests get logged before the client goes quiet. A server
+ * that keeps asking for a target we will not follow must not be able to fill
+ * the user's log file. */
+#define RECONNECT_REFUSAL_LOG_LIMIT 5
+
+/*
+ * Copies an AVal into a NUL-terminated buffer, refusing anything that does not
+ * fit. An AVal points straight into the received packet body and carries no
+ * terminator, so it must never reach a str*() function; every comparison against
+ * one goes through AVMATCH, which is length-bounded.
+ */
+static bool aval_to_buf(const AVal *val, char *buf, size_t buf_size)
+{
+	if (val->av_len < 0 || (size_t)val->av_len >= buf_size)
+		return false;
+	if (val->av_len > 0) {
+		if (!val->av_val)
+			return false;
+		memcpy(buf, val->av_val, (size_t)val->av_len);
+	}
+	buf[val->av_len] = '\0';
+	return true;
+}
+
+/* Safe arguments for a "%.*s" of a wire-supplied AVal: never a NULL pointer,
+ * and never more than `max` characters of a string whose length the server
+ * chose. */
+#define AVAL_FMT(v, max) ((v).av_len > (max) ? (max) : (v).av_len), ((v).av_val ? (v).av_val : "")
+
+/*
+ * Logs a refused reconnect request, up to a limit.
+ *
+ * How many of these arrive is the server's decision; how large the user's log
+ * file gets should not be. Every refusal path goes through here so that none of
+ * them can be used as an unbounded write.
+ */
+static void reconnect_refuse(struct rtmp_stream *stream, const char *target, const char *reason)
+{
+	if (stream->reconnect_refusals >= RECONNECT_REFUSAL_LOG_LIMIT)
+		return;
+
+	stream->reconnect_refusals++;
+	if (target && target[0])
+		warn("Refused a reconnect request to '%s': %s", target, reason);
+	else
+		warn("Refused a reconnect request: %s", reason);
+
+	if (stream->reconnect_refusals == RECONNECT_REFUSAL_LOG_LIMIT)
+		warn("Further refused reconnect requests will not be logged");
+}
+
+static void handle_reconnect_request(struct rtmp_stream *stream, AMFObject *info)
+{
+	AVal level = {0};
+	AVal code = {0};
+	AVal tc_url = {0};
+	AVal description = {0};
+	char requested[RTMP_RECONNECT_MAX_URL];
+	char resolved[RTMP_RECONNECT_MAX_URL];
+
+	AMFProp_GetString(AMF_GetProp(info, &av_code, -1), &code);
+
+	/*
+	 * `code` is the discriminator, and checking only `level` is not a
+	 * shortcut for it: every RTMP server sends NetStream.Publish.Start with
+	 * level "status" the instant publishing begins, so a level-only test
+	 * fires against ordinary servers, once per publish and then once per
+	 * keyframe forever after.
+	 */
+	if (!AVMATCH(&code, &av_reconnect_request))
+		return;
+
+	AMFProp_GetString(AMF_GetProp(info, &av_level, -1), &level);
+	if (!AVMATCH(&level, &av_status)) {
+		char note[128];
+		snprintf(note, sizeof(note), "level is '%.*s' and the specification requires \"status\"",
+			 AVAL_FMT(level, 32));
+		reconnect_refuse(stream, NULL, note);
+		return;
+	}
+
+	if (stream->handoff_state != HANDOFF_IDLE || !dstr_is_empty(&stream->reconnect_url)) {
+		debug("Ignoring a reconnect request: one is already in progress");
+		return;
+	}
+
+	if (stream->reconnect_count >= stream->reconnect_limit) {
+		if (stream->reconnect_count == stream->reconnect_limit) {
+			stream->reconnect_count++;
+			warn("Refusing further reconnect requests: this session has already "
+			     "followed %d, which is the configured limit",
+			     stream->reconnect_limit);
+		}
+		return;
+	}
+
+	AMFProp_GetString(AMF_GetProp(info, &av_tcUrl, -1), &tc_url);
+	if (!aval_to_buf(&tc_url, requested, sizeof(requested))) {
+		char note[128];
+		snprintf(note, sizeof(note), "the tcUrl is %d bytes, longer than the %d this client will accept",
+			 tc_url.av_len, (int)sizeof(requested) - 1);
+		reconnect_refuse(stream, NULL, note);
+		return;
+	}
+
+	enum rtmp_reconnect_verdict verdict =
+		rtmp_reconnect_resolve(stream->path.array, requested, resolved, sizeof(resolved));
+
+	if (verdict != RTMP_RECONNECT_ACCEPT) {
+		reconnect_refuse(stream, requested, rtmp_reconnect_verdict_str(verdict));
+		return;
+	}
+
+	stream->reconnect_count++;
+	dstr_copy(&stream->reconnect_url, resolved);
+
+	/* Logged only once the request has been accepted, so the number of these
+	 * lines is bounded by the per-session limit rather than by how often the
+	 * server feels like asking. */
+	AMFProp_GetString(AMF_GetProp(info, &av_description, -1), &description);
+	if (description.av_len > 0)
+		info("Server's reason for the reconnect: %.*s", AVAL_FMT(description, 200));
+
+	info("Reconnect requested: moving from %s to %s at the next keyframe (%d of %d allowed this session)",
+	     stream->path.array, resolved, stream->reconnect_count, stream->reconnect_limit);
+}
+
+static void process_invoke(struct rtmp_stream *stream, const RTMPPacket *packet)
+{
+	const char *body = packet->m_body;
+	unsigned int size = packet->m_nBodySize;
+	AMFObject invoke;
+	AMFObject status_info;
+	AVal method = {0};
+
+	/* An AMF3 command message prefixes the AMF0 payload with one byte. */
+	if (packet->m_packetType == RTMP_PACKET_TYPE_FLEX_MESSAGE) {
+		if (size < 1)
+			return;
+		body++;
+		size--;
+	}
+
+	/* Every command message starts with its name as an AMF0 string. */
+	if (size < 1 || size > INT_MAX || body[0] != AMF_STRING)
+		return;
+
+	int decoded = AMF_Decode(&invoke, body, (int)size, FALSE);
+
+	/* AMF_Decode populates the object as it goes and can still fail, so the
+	 * reset below is unconditional. */
+	if (decoded >= 0) {
+		AMFProp_GetString(AMF_GetProp(&invoke, NULL, 0), &method);
+
+		/* onStatus is (name, transaction id, null command object, info). */
+		if (AVMATCH(&method, &av_onStatus) && AMF_CountProp(&invoke) > 3) {
+			AMFProp_GetObject(AMF_GetProp(&invoke, NULL, 3), &status_info);
+			handle_reconnect_request(stream, &status_info);
+		}
+	}
+
+	AMF_Reset(&invoke);
+}
+
 static bool process_recv_data(struct rtmp_stream *stream, size_t size)
 {
 	UNUSED_PARAMETER(size);
@@ -263,7 +444,16 @@ static bool process_recv_data(struct rtmp_stream *stream, size_t size)
 	}
 
 	if (packet.m_body) {
-		/* do processing here */
+		/*
+		 * Only a fully reassembled message can be parsed. Until
+		 * RTMPPacket_IsReady, m_nBodySize is the length the sender
+		 * announced while only m_nBytesRead of the buffer have been
+		 * filled, so decoding it would read uninitialized heap.
+		 */
+		if (RTMPPacket_IsReady(&packet) && (packet.m_packetType == RTMP_PACKET_TYPE_INVOKE ||
+						    packet.m_packetType == RTMP_PACKET_TYPE_FLEX_MESSAGE))
+			process_invoke(stream, &packet);
+
 		RTMPPacket_Free(&packet);
 	}
 	return true;
@@ -488,6 +678,8 @@ static int send_audio_packet_ex(struct rtmp_stream *stream, struct encoder_packe
 
 static inline bool send_headers(struct rtmp_stream *stream);
 static inline bool send_footers(struct rtmp_stream *stream);
+static void reconnect_pump(struct rtmp_stream *stream, const struct encoder_packet *packet);
+static void reconnect_abort(struct rtmp_stream *stream);
 
 static inline bool can_shutdown_stream(struct rtmp_stream *stream, struct encoder_packet *packet)
 {
@@ -657,6 +849,16 @@ static void *send_thread(void *data)
 			}
 		}
 
+		/*
+		 * Enhanced RTMP v2 handoff. This sits between taking ownership of
+		 * the packet and sending it, so that when the cut-over happens the
+		 * packet in hand, the keyframe that triggered it, is simply
+		 * sent on the new connection instead of the old one. Nothing about
+		 * packet ownership changes: the packet is already a local, popped
+		 * from the deque above, and it goes out exactly once either way.
+		 */
+		reconnect_pump(stream, &packet);
+
 		if (!stream->sent_headers) {
 			if (!send_headers(stream)) {
 				os_atomic_set_bool(&stream->disconnected, true);
@@ -693,6 +895,11 @@ static void *send_thread(void *data)
 			pthread_mutex_unlock(&stream->dbr_mutex);
 		}
 	}
+
+	/* Nothing below may run while the handoff thread is still writing into
+	 * the stream, and any connection it opened has to be closed rather than
+	 * leaked. This is the only place the send thread leaves the loop. */
+	reconnect_abort(stream);
 
 	bool encode_error = os_atomic_load_bool(&stream->encode_error);
 
@@ -747,8 +954,9 @@ static void *send_thread(void *data)
 	return NULL;
 }
 
-/* `rtmp` is a parameter rather than stream->rtmp so that a caller can put the
- * metadata on a connection that is not (yet) the active one. */
+/* `rtmp` is a parameter rather than stream->rtmp because a server-directed
+ * handoff sends the metadata on the incoming connection while the outgoing one
+ * is still the active. */
 static bool send_meta_data(struct rtmp_stream *stream, RTMP *rtmp)
 {
 	uint8_t *meta_data;
@@ -1165,14 +1373,13 @@ static void win32_log_interface_type(struct rtmp_stream *stream, RTMP *rtmp)
 
 /*
  * Brings `rtmp` all the way to "publishing to `path`", short of starting the
- * send machinery.
+ * send machinery. Both the initial connect and a server-directed handoff go
+ * through here so a handoff cannot negotiate the connection
+ * slightly differently from the initial connect would be a second code path
+ * that nothing exercises until a production redirect fires.
  *
- * `path` must outlive `rtmp`: RTMP_SetupURL does not copy the URL, it points
+ * `path` must outlive `rtmp`. RTMP_SetupURL does not copy the URL; it points
  * Link.hostname, Link.app and Link.tcUrl straight into the string it is given.
- *
- * Failures are reported to the caller rather than raised on the output here,
- * because not every caller of this is establishing the connection the user is
- * waiting on.
  */
 static int connect_rtmp(struct rtmp_stream *stream, RTMP *rtmp, struct dstr *path)
 {
@@ -1193,6 +1400,16 @@ static int connect_rtmp(struct rtmp_stream *stream, RTMP *rtmp, struct dstr *pat
 
 	RTMP_EnableWrite(rtmp);
 
+	/*
+	 * Declare only what this client actually implements at the connection
+	 * layer, and only when the user has turned it on. capsEx is a promise:
+	 * a server that sees the Reconnect bit is entitled to hand us to another
+	 * host, so advertising it unconditionally would opt every OBS user into
+	 * being redirectable whether or not anything would honor it.
+	 */
+	if (stream->reconnect_request)
+		RTMP_SetCapsEx(rtmp, RTMP_CAPS_EX_RECONNECT);
+
 	dstr_copy(&stream->encoder_name, "FMLE/3.0 (compatible; FMSc/1.0)");
 
 	set_rtmp_dstr(&rtmp->Link.pubUser, &stream->username);
@@ -1203,8 +1420,7 @@ static int connect_rtmp(struct rtmp_stream *stream, RTMP *rtmp, struct dstr *pat
 	if (dstr_is_empty(&stream->bind_ip) || dstr_cmp(&stream->bind_ip, "default") == 0) {
 		memset(&rtmp->m_bindIP, 0, sizeof(rtmp->m_bindIP));
 	} else {
-		bool success =
-			netif_str_to_addr(&rtmp->m_bindIP.addr, &rtmp->m_bindIP.addrLen, stream->bind_ip.array);
+		bool success = netif_str_to_addr(&rtmp->m_bindIP.addr, &rtmp->m_bindIP.addrLen, stream->bind_ip.array);
 		if (success) {
 			int len = rtmp->m_bindIP.addrLen;
 			bool ipv6 = len == sizeof(struct sockaddr_in6);
@@ -1226,6 +1442,9 @@ static int connect_rtmp(struct rtmp_stream *stream, RTMP *rtmp, struct dstr *pat
 	win32_log_interface_type(stream, rtmp);
 #endif
 
+	/* The caller decides what a failure means. A failed initial connect is
+	 * the user's problem and gets surfaced; a failed handoff is not, because
+	 * the stream it would have replaced is still running. */
 	if (!RTMP_Connect(rtmp, NULL))
 		return OBS_OUTPUT_CONNECT_FAILED;
 
@@ -1237,6 +1456,193 @@ static int connect_rtmp(struct rtmp_stream *stream, RTMP *rtmp, struct dstr *pat
 	info("Connection to %s (%s) successful", path->array, ip_address);
 
 	return OBS_OUTPUT_SUCCESS;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Server-directed handoff: connect the new server, then drop the old one.   */
+
+/*
+ * Relocates an RTMP context by value.
+ *
+ * This is safe because m_sb.sb_start is the only pointer an RTMP holds into
+ * itself: it indexes m_sb.sb_buf, and RTMPSockBuf_Fill only ever resets it to
+ * sb_buf or advances it within sb_buf. Everything else it owns is either heap
+ * (m_read.buf, m_write.m_body, m_vecChannelsIn/Out, m_methodCalls, the TLS
+ * context, Link.streams[].playpath) or points at caller-owned strings that
+ * outlive the move (Link.hostname/app/tcUrl into the path dstr, Link.flashVer
+ * and the publish credentials into the stream's own dstrs).
+ *
+ * `src` is left zeroed and disconnected, so closing or freeing it afterwards is
+ * a no-op rather than a double free.
+ */
+static void rtmp_move(RTMP *dst, RTMP *src)
+{
+	ptrdiff_t sb_offset = src->m_sb.sb_start ? (src->m_sb.sb_start - src->m_sb.sb_buf) : 0;
+
+	*dst = *src;
+	dst->m_sb.sb_start = dst->m_sb.sb_buf + sb_offset;
+
+	memset(src, 0, sizeof(*src));
+	src->m_sb.sb_socket = -1;
+}
+
+static void *reconnect_handoff_thread(void *data)
+{
+	struct rtmp_stream *stream = data;
+
+	os_set_thread_name("rtmp-stream: reconnect");
+
+	int ret = connect_rtmp(stream, &stream->handoff_rtmp, &stream->handoff_path);
+
+	/* Publishes handoff_rtmp and handoff_path to the send thread, which
+	 * joins this thread before reading either. */
+	os_atomic_set_long(&stream->handoff_result, ret == OBS_OUTPUT_SUCCESS ? 1 : -1);
+	return NULL;
+}
+
+/* Discards an incoming connection that will not be used, and returns the
+ * handoff machinery to idle. Send thread only, and only once the handoff
+ * thread has been joined. */
+static void reconnect_discard(struct rtmp_stream *stream)
+{
+	RTMP_Close(&stream->handoff_rtmp);
+	RTMP_TLS_Free(&stream->handoff_rtmp);
+	memset(&stream->handoff_rtmp, 0, sizeof(stream->handoff_rtmp));
+	stream->handoff_rtmp.m_sb.sb_socket = -1;
+
+	dstr_free(&stream->handoff_path);
+	dstr_free(&stream->reconnect_url);
+	os_atomic_set_long(&stream->handoff_result, 0);
+	stream->handoff_state = HANDOFF_IDLE;
+}
+
+/* Joins an in-flight handoff and throws the result away. Used when the stream
+ * is going down for any reason; the send thread must not exit while another
+ * thread is still writing into the stream. */
+static void reconnect_abort(struct rtmp_stream *stream)
+{
+	if (stream->handoff_state == HANDOFF_CONNECTING)
+		pthread_join(stream->handoff_thread, NULL);
+
+	if (stream->handoff_state != HANDOFF_IDLE)
+		reconnect_discard(stream);
+	else
+		dstr_free(&stream->reconnect_url);
+}
+
+static void reconnect_start(struct rtmp_stream *stream)
+{
+	dstr_copy_dstr(&stream->handoff_path, &stream->reconnect_url);
+	os_atomic_set_long(&stream->handoff_result, 0);
+
+	if (pthread_create(&stream->handoff_thread, NULL, reconnect_handoff_thread, stream) != 0) {
+		warn("Could not start the reconnect thread; staying on %s", stream->path.array);
+		dstr_free(&stream->handoff_path);
+		dstr_free(&stream->reconnect_url);
+		return;
+	}
+
+	stream->handoff_state = HANDOFF_CONNECTING;
+	info("Reconnect: establishing %s while %s keeps carrying the stream", stream->handoff_path.array,
+	     stream->path.array);
+}
+
+/*
+ * Cuts over to the connection the handoff thread established.
+ *
+ * The order here is the point of the whole feature: the new server is already
+ * publishing before anything is said to the old one, and the old connection is
+ * closed only after the new one has accepted the stream metadata. If the new
+ * server rejects us at that last moment, nothing has been lost: the outgoing
+ * connection is still open and still the active one.
+ */
+static void reconnect_commit(struct rtmp_stream *stream)
+{
+	RTMP outgoing;
+	struct dstr outgoing_path;
+
+	/* Metadata is what init_send() puts on the wire first, so the incoming
+	 * connection gets it first too, while it is still expendable. */
+	if (!send_meta_data(stream, &stream->handoff_rtmp)) {
+		warn("Reconnect to %s failed while sending metadata; staying on %s", stream->handoff_path.array,
+		     stream->path.array);
+		reconnect_discard(stream);
+		return;
+	}
+
+	rtmp_move(&outgoing, &stream->rtmp);
+	rtmp_move(&stream->rtmp, &stream->handoff_rtmp);
+
+	/* The path dstr backs the RTMP's Link strings, so it moves with it
+	 * rather than being copied over. dstr_init here means "this handle no
+	 * longer owns the buffer", not "free it"; ownership went to
+	 * stream->path on the line above. */
+	outgoing_path = stream->path;
+	stream->path = stream->handoff_path;
+	dstr_init(&stream->handoff_path);
+
+	/* Sequence headers are per-connection. send_thread re-sends them,
+	 * along with the keyframe it is holding, on the connection that is now
+	 * current. start_dts_offset does not move: the media
+	 * timeline is continuous across the handoff, which is what a downstream
+	 * packager needs in order to treat this as one broadcast. */
+	stream->sent_headers = false;
+
+	dstr_free(&stream->reconnect_url);
+	os_atomic_set_long(&stream->handoff_result, 0);
+	stream->handoff_state = HANDOFF_IDLE;
+
+	info("Reconnect complete: now publishing to %s; closing %s", stream->path.array, outgoing_path.array);
+
+	RTMP_Close(&outgoing);
+	RTMP_TLS_Free(&outgoing);
+	dstr_free(&outgoing_path);
+}
+
+/* A video keyframe on the first video track is the media boundary the spec
+ * asks the client to wait for. Every other video track keyframes with it, so
+ * cutting over here keeps each GOP whole on one server. */
+static inline bool is_media_boundary(const struct encoder_packet *packet)
+{
+	return packet->type == OBS_ENCODER_VIDEO && packet->keyframe && packet->track_idx == 0;
+}
+
+/*
+ * Advances the handoff one step, if there is one. Called from the send thread
+ * with the packet that is about to go out, which is also the packet that will
+ * be the first thing the new server sees if this is the boundary.
+ */
+static void reconnect_pump(struct rtmp_stream *stream, const struct encoder_packet *packet)
+{
+	switch (stream->handoff_state) {
+	case HANDOFF_IDLE:
+		if (dstr_is_empty(&stream->reconnect_url))
+			return;
+		reconnect_start(stream);
+		return;
+
+	case HANDOFF_CONNECTING: {
+		long result = os_atomic_load_long(&stream->handoff_result);
+		if (result == 0)
+			return;
+
+		pthread_join(stream->handoff_thread, NULL);
+
+		if (result < 0) {
+			warn("Reconnect to %s failed; staying on %s", stream->handoff_path.array, stream->path.array);
+			reconnect_discard(stream);
+			return;
+		}
+
+		stream->handoff_state = HANDOFF_ARMED;
+	}
+		/* fallthrough: this packet may already be the boundary */
+
+	case HANDOFF_ARMED:
+		if (is_media_boundary(packet))
+			reconnect_commit(stream);
+		return;
+	}
 }
 
 static int try_connect(struct rtmp_stream *stream)
@@ -1378,6 +1784,21 @@ static bool init_connect(struct rtmp_stream *stream)
 	dstr_copy(&stream->password, obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_PASSWORD));
 	dstr_depad(&stream->path);
 	dstr_depad(&stream->key);
+
+	dstr_free(&stream->reconnect_url);
+	stream->reconnect_count = 0;
+	stream->reconnect_refusals = 0;
+	stream->handoff_state = HANDOFF_IDLE;
+	os_atomic_set_long(&stream->handoff_result, 0);
+
+	stream->reconnect_request = obs_data_get_bool(settings, OPT_RECONNECT_REQUEST);
+
+	stream->reconnect_limit = (int)obs_data_get_int(settings, OPT_RECONNECT_REQUEST_LIMIT);
+	if (stream->reconnect_limit < 0)
+		stream->reconnect_limit = 0;
+	if (stream->reconnect_limit > RECONNECT_REQUEST_LIMIT_MAX)
+		stream->reconnect_limit = RECONNECT_REQUEST_LIMIT_MAX;
+
 	drop_b = (int64_t)obs_data_get_int(settings, OPT_DROP_THRESHOLD);
 	drop_p = (int64_t)obs_data_get_int(settings, OPT_PFRAME_DROP_THRESHOLD);
 	stream->max_shutdown_time_sec = (int)obs_data_get_int(settings, OPT_MAX_SHUTDOWN_TIME_SEC);
@@ -1513,6 +1934,21 @@ static bool init_connect(struct rtmp_stream *stream)
 	stream->new_socket_loop = false;
 	stream->low_latency_mode = false;
 #endif
+
+	/*
+	 * The Windows socket loop runs on its own thread and holds the active
+	 * socket and send buffer directly (rtmp-windows.c), so the send thread
+	 * cannot substitute one connection for another underneath it. Rather
+	 * than advertise a capability we would not honor, the feature turns
+	 * itself off and says so.
+	 */
+	if (stream->new_socket_loop && stream->reconnect_request) {
+		warn("Server-directed reconnect disabled: it is not compatible with the new socket loop");
+		stream->reconnect_request = false;
+	}
+
+	if (stream->reconnect_request)
+		info("Server-directed reconnect enabled (at most %d per session)", stream->reconnect_limit);
 
 	obs_data_release(settings);
 	return true;
@@ -1928,6 +2364,10 @@ static void rtmp_stream_defaults(obs_data_t *defaults)
 	obs_data_set_default_int(defaults, OPT_PFRAME_DROP_THRESHOLD, 900);
 	obs_data_set_default_int(defaults, OPT_MAX_SHUTDOWN_TIME_SEC, 30);
 	obs_data_set_default_string(defaults, OPT_BIND_IP, "default");
+	/* Off unless a front-end or the user turns it on: honoring a redirect
+	 * sends the stream key to a host the user did not choose. */
+	obs_data_set_default_bool(defaults, OPT_RECONNECT_REQUEST, false);
+	obs_data_set_default_int(defaults, OPT_RECONNECT_REQUEST_LIMIT, 5);
 #ifdef _WIN32
 	obs_data_set_default_bool(defaults, OPT_NEWSOCKETLOOP_ENABLED, false);
 	obs_data_set_default_bool(defaults, OPT_LOWLATENCY_ENABLED, false);
@@ -1964,6 +2404,12 @@ static obs_properties_t *rtmp_stream_properties(void *unused)
 		obs_property_list_add_string(p, item.name, item.addr);
 	}
 	netif_saddr_data_free(&addrs);
+
+	p = obs_properties_add_bool(props, OPT_RECONNECT_REQUEST, obs_module_text("RTMPStream.ReconnectRequest"));
+	obs_property_set_long_description(p, obs_module_text("RTMPStream.ReconnectRequest.Description"));
+
+	obs_properties_add_int(props, OPT_RECONNECT_REQUEST_LIMIT, obs_module_text("RTMPStream.ReconnectRequest.Limit"),
+			       0, RECONNECT_REQUEST_LIMIT_MAX, 1);
 
 #ifdef _WIN32
 	obs_properties_add_bool(props, OPT_NEWSOCKETLOOP_ENABLED, obs_module_text("RTMPStream.NewSocketLoop"));

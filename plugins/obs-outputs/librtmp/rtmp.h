@@ -199,7 +199,7 @@ extern "C"
 
     /* Enhanced RTMP v2 "CapsExMask": the extended capabilities a client can
      * declare to the server through the capsEx property of the connect
-     * command. Only advertise a bit the caller genuinely implements -- the
+     * command. Only advertise a bit the caller genuinely implements: the
      * server is entitled to act on it. */
 #define RTMP_CAPS_EX_RECONNECT             0x01
 #define RTMP_CAPS_EX_MULTITRACK            0x02

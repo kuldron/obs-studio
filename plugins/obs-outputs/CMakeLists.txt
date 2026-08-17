@@ -57,6 +57,8 @@ target_sources(
     rtmp-av1.c
     rtmp-av1.h
     rtmp-helpers.h
+    rtmp-reconnect.c
+    rtmp-reconnect.h
     rtmp-stream.c
     rtmp-stream.h
     rtmp-windows.c

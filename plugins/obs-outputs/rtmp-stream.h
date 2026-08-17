@@ -4,10 +4,12 @@
 #include <util/dstr.h>
 #include <util/threading.h>
 #include <inttypes.h>
+#include <limits.h>
 #include "librtmp/rtmp.h"
 #include "librtmp/log.h"
 #include "flv-mux.h"
 #include "net-if.h"
+#include "rtmp-reconnect.h"
 
 #ifdef _WIN32
 #include <Iphlpapi.h>
@@ -32,6 +34,13 @@
 #define OPT_NEWSOCKETLOOP_ENABLED "new_socket_loop_enabled"
 #define OPT_LOWLATENCY_ENABLED "low_latency_mode_enabled"
 #define OPT_METADATA_MULTITRACK "metadata_multitrack"
+#define OPT_RECONNECT_REQUEST "ertmp_reconnect_request"
+#define OPT_RECONNECT_REQUEST_LIMIT "ertmp_reconnect_request_limit"
+
+/* Ceiling on OPT_RECONNECT_REQUEST_LIMIT. A server that can talk the client
+ * into an unbounded redirect chain has a reflected-traffic primitive, so the
+ * setting is clamped rather than trusted. */
+#define RECONNECT_REQUEST_LIMIT_MAX 20
 
 //#define TEST_FRAMEDROPS
 //#define TEST_FRAMEDROPS_WITH_BITRATE_SHORTCUTS
@@ -55,6 +64,18 @@ struct dbr_frame {
 
 struct dbr_interpolation_point {
 	long bitrates[MAX_OUTPUT_VIDEO_ENCODERS];
+};
+
+/* Progress of an Enhanced RTMP v2 server-directed handoff. */
+enum handoff_state {
+	/* No request outstanding. */
+	HANDOFF_IDLE,
+	/* The handoff thread is establishing the new connection while the send
+	 * thread keeps publishing to the current one. */
+	HANDOFF_CONNECTING,
+	/* The new connection is up and publishing; waiting for the next video
+	 * keyframe to cut over. */
+	HANDOFF_ARMED,
 };
 
 struct rtmp_stream {
@@ -87,6 +108,32 @@ struct rtmp_stream {
 	struct dstr encoder_name;
 	struct dstr bind_ip;
 	socklen_t addrlen_hint; /* hint IPv4 vs IPv6 */
+
+	/* Enhanced RTMP v2 "Reconnect Request".
+	 *
+	 * Threading contract: every field below except `handoff_result` belongs
+	 * to the send thread for the whole life of a session. That is not an
+	 * accident of the current code: the request arrives on the send thread
+	 * too, because handle_socket_read() runs inside send_packet*(), so the
+	 * parse, the decision, the cut-over and the teardown are all one thread.
+	 *
+	 * `handoff_result` is the single crossing: the handoff thread writes it
+	 * exactly once when it finishes, and the send thread polls it. The send
+	 * thread joins the handoff thread before it reads `handoff_rtmp` or
+	 * `handoff_path`, and that join is what publishes them; nothing else may
+	 * read those two fields while HANDOFF_CONNECTING.
+	 */
+	bool reconnect_request;
+	int reconnect_limit;
+	int reconnect_count;
+	int reconnect_refusals;
+	struct dstr reconnect_url;
+
+	enum handoff_state handoff_state;
+	volatile long handoff_result; /* 0 pending, 1 connected, -1 failed */
+	pthread_t handoff_thread;
+	RTMP handoff_rtmp;
+	struct dstr handoff_path; /* backs handoff_rtmp's Link AVals */
 
 	/* frame drop variables */
 	int64_t drop_threshold_usec;
